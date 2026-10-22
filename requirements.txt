@@ -1,0 +1,8 @@
+openai
+traceloop-sdk
+httpx
+anthropic
+google-genai
+langchain-openai
+llama-index-core
+llama-index-llms-openai-like

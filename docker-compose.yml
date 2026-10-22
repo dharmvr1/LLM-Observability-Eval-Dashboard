@@ -1,0 +1,45 @@
+services:
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      CLICKHOUSE_DB: otel
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: dev
+    ports:
+      - "8123:8123"   # HTTP (curl / Python)
+      - "9000:9000"   # native (the collector uses this)
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8123/ping"]
+      interval: 3s
+      retries: 20
+
+  # Local fake S3. The "raw event archive" from the README goes here.
+  s3:
+    image: adobe/s3mock:latest
+    environment:
+      COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: raw-events
+    ports:
+      - "9090:9090"   # S3 API (http)
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.111.0
+    command: ["--config=/etc/otel/config.yaml"]
+    environment:
+      AWS_ACCESS_KEY_ID: dev
+      AWS_SECRET_ACCESS_KEY: dev
+      # README says keep 10% of successful traces. Set to 100 while testing.
+      SUCCESS_SAMPLE_PCT: ${SUCCESS_SAMPLE_PCT:-10}
+    volumes:
+      - ./collector/config.yaml:/etc/otel/config.yaml:ro
+    ports:
+      - "4318:4318"   # OTLP HTTP
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      s3:
+        condition: service_started
+
+volumes:
+  clickhouse-data:

@@ -1,0 +1,61 @@
+# receivers -> processors -> exporters, joined by "pipelines".
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Waits for a whole trace to finish, then decides: keep or drop.
+  # Keep 100% of traces with an error, and a percentage of the rest.
+  tail_sampling:
+    decision_wait: 5s
+    policies:
+      - name: keep-errors
+        type: status_code
+        status_code:
+          status_codes: [ERROR]
+      - name: sample-successes
+        type: probabilistic
+        probabilistic:
+          sampling_percentage: ${env:SUCCESS_SAMPLE_PCT}
+
+  batch:
+    timeout: 1s
+
+exporters:
+  debug:
+    verbosity: basic
+
+  # Spans -> otel.otel_traces (the exporter creates the table itself).
+  clickhouse:
+    endpoint: tcp://clickhouse:9000
+    database: otel
+    username: default
+    password: dev
+    create_schema: true
+
+  # Raw spans as JSON files in the bucket raw-events.
+  awss3:
+    marshaler: otlp_json
+    s3uploader:
+      region: us-east-1
+      s3_bucket: raw-events
+      s3_prefix: traces
+      s3_partition: minute
+      endpoint: http://s3:9090
+      s3_force_path_style: true
+      disable_ssl: true
+
+service:
+  pipelines:
+    # Sampled spans go to ClickHouse for analytics.
+    traces:
+      receivers: [otlp]
+      processors: [tail_sampling, batch]
+      exporters: [debug, clickhouse]
+    # EVERY span is archived raw (before sampling), so nothing is lost.
+    traces/archive:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [awss3]
