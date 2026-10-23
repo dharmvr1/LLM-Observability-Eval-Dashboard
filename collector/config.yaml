@@ -15,10 +15,33 @@ processors:
         type: status_code
         status_code:
           status_codes: [ERROR]
+      # Security checks must see every risky response, so keep any trace whose response text
+      # looks like an SSN or an email, no matter what percentage of other traces we sample.
+      - name: keep-ssn-like
+        type: string_attribute
+        string_attribute:
+          key: gen_ai.output.messages
+          values: ['\d{3}-\d{2}-\d{4}']
+          enabled_regex_matching: true
+      - name: keep-email-like
+        type: string_attribute
+        string_attribute:
+          key: gen_ai.output.messages
+          values: ['[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+\.[A-Za-z]{2,}']
+          enabled_regex_matching: true
       - name: sample-successes
         type: probabilistic
         probabilistic:
           sampling_percentage: ${env:SUCCESS_SAMPLE_PCT}
+
+  # The Anthropic SDK emits its own span as well as Traceloop's, both with the same token counts.
+  # Counting both would double tokens and cost. We keep Traceloop's (it has the prompt and the
+  # answer) and drop the SDK's own span. The raw S3 archive pipeline still receives both.
+  filter/drop_anthropic_sdk_duplicate:
+    error_mode: ignore
+    traces:
+      span:
+        - 'instrumentation_scope.name == "com.anthropic.sdk.python"'
 
   batch:
     timeout: 1s
@@ -52,7 +75,7 @@ service:
     # Sampled spans go to ClickHouse for analytics.
     traces:
       receivers: [otlp]
-      processors: [tail_sampling, batch]
+      processors: [filter/drop_anthropic_sdk_duplicate, tail_sampling, batch]
       exporters: [debug, clickhouse]
     # EVERY span is archived raw (before sampling), so nothing is lost.
     traces/archive:

@@ -1,7 +1,7 @@
 # Step 5: check recent LLM responses for PII leaks and fill the triage queue.
 #
-#   python app/pii_job.py           run once
-#   python app/pii_job.py loop      run every minute (leaks should be found within minutes)
+#   python -m app.jobs.pii_job           run once
+#   python -m app.jobs.pii_job loop      run every minute (leaks should be found within minutes)
 #
 # Per span:  regex first (free). If the regex finds nothing, ask the guard LLM.
 #            risk = 1.0 if the regex matched, else the guard's score.
@@ -12,13 +12,17 @@ import sys
 import time
 
 import clickhouse_connect
-from pii import (
+from app.lib import usage
+from app.lib.pii import (
     PII_JUDGE_MODEL,
     PII_THRESHOLD,
     ask_guard_llm,
     find_pii_with_regex,
+    is_hard_hit,
+    REVIEW_RISK,
     mask_digits,
     message_text,
+    triage_status,
 )
 
 WINDOW_MINUTES = 15
@@ -48,15 +52,21 @@ def run_once():
 
     checks = []  # rows for otel.pii_checks
     triage = []  # rows for otel.pii_triage
+    usage.current["job"] = "pii_job"
     for trace_id, span_id, app_id, user_id, output_json in spans:
+        if usage.tokens_left(PII_JUDGE_MODEL) <= 0:
+            print(f"daily token budget ({usage.DAILY_TOKEN_BUDGET}) reached for {PII_JUDGE_MODEL}, stopping")
+            break
+        usage.current["span_id"] = span_id
         answer = message_text(output_json, "assistant")
 
         hits = find_pii_with_regex(answer)
-        if hits:
+        if is_hard_hit(hits):
             types = sorted({kind for kind, _ in hits})
             llm_score, risk = -1.0, 1.0  # -1 means "guard LLM skipped, regex was enough"
             reason = "regex matched: " + ", ".join(types)
         else:
+            # No hit, or only email/phone hits: the guard LLM decides.
             try:
                 llm_score, types, reason = ask_guard_llm(answer)
             except RuntimeError:
@@ -65,12 +75,16 @@ def run_once():
                 continue
             risk = llm_score
 
-        flagged = risk >= PII_THRESHOLD
-        print(f"- {user_id}: risk={risk:.2f} types={types} {'FLAGGED' if flagged else 'ok'}")
+        status = triage_status(hits, llm_score)
+        if status == "review":
+            types = sorted({kind for kind, _ in hits})
+            risk = REVIEW_RISK
+            reason = f"regex matched {', '.join(types)} but the guard scored {llm_score:.2f}: needs a human look"
+        print(f"- {user_id}: risk={risk:.2f} types={types} {status.upper() if status else 'ok'}")
 
         checks.append([trace_id, span_id, app_id, user_id, sorted({k for k, _ in hits}), llm_score, risk, reason, PII_JUDGE_MODEL])
-        if flagged:
-            triage.append([trace_id, span_id, app_id, user_id, risk, types, reason, mask_digits(answer[:300])])
+        if status:
+            triage.append([trace_id, span_id, app_id, user_id, risk, types, reason, mask_digits(answer[:300]), status])
 
     if checks:
         db.insert(
@@ -83,14 +97,16 @@ def run_once():
         db.insert(
             "otel.pii_triage",
             triage,
-            column_names=["trace_id", "span_id", "app_id", "user_id", "risk", "types", "reason", "preview_masked"],
+            column_names=["trace_id", "span_id", "app_id", "user_id", "risk", "types", "reason", "preview_masked", "status"],
         )
+    usage.flush()
     print(f"checked {len(checks)} spans, {len(triage)} sent to triage")
 
 
-if len(sys.argv) > 1 and sys.argv[1] == "loop":
-    while True:
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "loop":
+        while True:
+            run_once()
+            time.sleep(LOOP_SECONDS)
+    else:
         run_once()
-        time.sleep(LOOP_SECONDS)
-else:
-    run_once()

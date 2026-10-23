@@ -8,3 +8,6 @@ llama-index-core
 llama-index-llms-openai-like
 deepeval
 clickhouse-connect
+langchain
+llama-index
+sentence-transformers

@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS otel.pii_triage
     types            Array(String),
     reason           String,
     preview_masked   String,
-    status           LowCardinality(String) DEFAULT 'open'    -- open | confirmed | false_positive
+    status           LowCardinality(String) DEFAULT 'open'    -- open (high) | review (low, regex-only) | confirmed | false_positive
 )
 ENGINE = MergeTree
 ORDER BY (status, created_at);

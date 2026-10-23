@@ -1,7 +1,7 @@
 # Step 4: score recent LLM calls with DeepEval and write the scores back to ClickHouse.
 #
-#   python app/eval_job.py           run once
-#   python app/eval_job.py loop      run every 15 minutes (the "scheduled job")
+#   python -m app.jobs.eval_job           run once
+#   python -m app.jobs.eval_job loop      run every 15 minutes (the "scheduled job")
 #
 # Per run:
 #   1. read spans from the last 15 minutes that have not been scored yet
@@ -20,6 +20,7 @@ import time
 os.environ["DEEPEVAL_TELEMETRY_OPT_OUT"] = "YES"
 
 import clickhouse_connect
+from app.lib import usage
 from deepeval.metrics import AnswerRelevancyMetric, FaithfulnessMetric, ToxicityMetric
 from deepeval.models import DeepEvalBaseLLM
 from deepeval.test_case import LLMTestCase
@@ -77,6 +78,7 @@ class GroqJudge(DeepEvalBaseLLM):
                     temperature=JUDGE_TEMPERATURE,
                     **kwargs,
                 )
+                usage.record(JUDGE_MODEL, r.usage)
                 text = r.choices[0].message.content
                 return schema.model_validate_json(text) if schema is not None else text
             except Exception as e:
@@ -152,7 +154,7 @@ def score_span(question, answer, context):
             (
                 "faithfulness",
                 FaithfulnessMetric(
-                    model=judge, threshold=0.5, include_reason=True, penalize_ambiguous_claims=True
+                    model=judge, threshold=0.8, include_reason=True, penalize_ambiguous_claims=True
                 ),
             )
         )
@@ -180,13 +182,20 @@ def run_once():
     print(f"found {len(spans)} unscored spans in the last {WINDOW_MINUTES} min")
 
     rows = []
+    usage.current["job"] = "eval_job"
     for trace_id, span_id, app_id, user_id, input_json, output_json in spans:
+        # Stop before the daily token budget is gone. Unscored spans simply wait for the next run.
+        if usage.tokens_left(JUDGE_MODEL) <= 0:
+            print(f"daily token budget ({usage.DAILY_TOKEN_BUDGET}) reached for {JUDGE_MODEL}, stopping")
+            break
+        usage.current["span_id"] = span_id
         question = message_text(input_json, "user")
         context = message_text(input_json, "system")
         answer = message_text(output_json, "assistant")
         print(f"- {user_id}: {question[:60]!r}")
 
         results, failed = score_span(question, answer, context)
+        usage.flush()  # save the tokens this span used, even if it failed
         if failed:
             # Save nothing for this span: it stays "unscored" and is retried on the next run.
             print(f"   {failed} metric(s) failed, will retry this span next run")
@@ -219,9 +228,10 @@ def run_once():
     print(f"wrote {len(rows)} eval rows")
 
 
-if len(sys.argv) > 1 and sys.argv[1] == "loop":
-    while True:
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "loop":
+        while True:
+            run_once()
+            time.sleep(WINDOW_MINUTES * 60)
+    else:
         run_once()
-        time.sleep(WINDOW_MINUTES * 60)
-else:
-    run_once()

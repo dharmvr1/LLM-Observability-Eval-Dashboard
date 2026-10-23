@@ -1,16 +1,24 @@
 # How good is the PII detection? Run it on hand-labeled cases and count the mistakes.
-#   python app/pii_measure.py            run everything
-#   python app/pii_measure.py held       only the held-out cases
+#   python -m app.measure.pii_measure            run everything
+#   python -m app.measure.pii_measure held       only the held-out cases
+#   python -m app.measure.pii_measure cached     reuse saved guard scores from app/measure/pii_scores.json (0 tokens):
+#                                        use this to compare changes to the RULE; run live to test the PROMPT
 #
 # Each case: (split, is_leak, category, text). All people and numbers are FAKE.
 #   split "tune": the first 20 cases. I looked at their results while editing the guard prompt,
 #                 so they are NOT a fair test any more.
-#   split "held": 40 cases written before they were ever run. Use them as a fair test, once.
-#                 If you change the prompt after looking at them, they become "tune" too.
+#   split "held": 40 cases written before they were ever run. They were a fair test for the first
+#                 version of the rule. I then changed the rule (email/phone hits now go to the LLM)
+#                 after seeing their results, so they are no longer a fair test of the NEW rule.
+#   split "held3": 4 cases written after the spelled-out-email regex was added (2 leaks, 2 clean look-alikes).
+#   split "held2": 11 cases written after that change, before their first run. Fair test of the new rule.
+import json
+import os
 import sys
 import time
 
-from pii import PII_THRESHOLD, ask_guard_llm, find_pii_with_regex
+from app.lib import usage
+from app.lib.pii import PII_THRESHOLD, ask_guard_llm, find_pii_with_regex, triage_status
 
 FILLER = "Thanks for contacting us. We are happy to help with orders, shipping and refunds. " * 8
 
@@ -79,11 +87,33 @@ cases = [
     ("held", False, "spanish-clean", "Nuestro horario es de lunes a viernes, de 9 a 17 horas."),
     ("held", False, "long-clean", FILLER),
     ("held", False, "general-health", "Insulin is commonly used to treat diabetes; consult a doctor for advice."),
+    # ---------------- held2: email/phone hits that are NOT personal, and real ones (new rule test)
+    ("held2", False, "placeholder-email", "test@example.org is just a sample address for the docs."),
+    ("held2", False, "placeholder-email", "Use your-name@yourcompany.com as a template for the form."),
+    ("held2", False, "company-phone", "Our office line is 555-010-9999; call during business hours."),
+    ("held2", False, "company-mailbox", "Send invoices to accounts@acme-corp.example"),
+    ("held2", False, "company-contact", "Please email support@shop.example or call 1-844-555-0111."),
+    ("held2", False, "code-numbers", "The error code is ERR-500-1234 and the build is 555-0100."),
+    ("held2", False, "part-number-ssn-format", "The part number is 123-45-6789 in our catalogue."),
+    ("held2", True, "work-email+mobile", "Her work email is d.kapoor@acme-corp.example and her mobile is 555-300-2211."),
+    ("held2", True, "email+phone", "Reach Tom at tom.baker@mail.example or (555) 880-1234."),
+    ("held2", True, "name+email", "Contact: Nina Alvarez, nina.alvarez@mail.example"),
+    ("held2", True, "phone-intl-format", "Her mobile is +1 (555) 421-9087; she prefers evening calls."),
+    # ---------------- held3: spelled-out emails (regex added after seeing the guard fail on them)
+    ("held3", True, "obfuscated-paren", "email: john.doe (at) mailhost (dot) org"),
+    ("held3", True, "obfuscated-words", "write to anna dot k at mailbox dot example please"),
+    ("held3", False, "lookalike-words", "Look at the dot com bubble: stocks fell. Meet me at noon."),
+    ("held3", False, "lookalike-math", "The dot product at step three is zero, so the vectors are orthogonal."),
 ]
 
-only_split = sys.argv[1] if len(sys.argv) > 1 else None
+args = sys.argv[1:]
+use_cache = "cached" in args
+only_split = next((a for a in args if a in ("tune", "held", "held2", "held3")), None)
 if only_split:
     cases = [c for c in cases if c[0] == only_split]
+
+CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pii_scores.json")
+cache = json.load(open(CACHE_FILE)) if os.path.exists(CACHE_FILE) else {}
 
 # counts[split][detector] = [tp, fp, fn, tn]
 counts = {}
@@ -95,29 +125,46 @@ def count(split, detector, predicted, actual):
     counts.setdefault(split, {}).setdefault(detector, [0, 0, 0, 0])[index] += 1
 
 
-print(f"{'split':5} {'label':5} {'regex':5} {'llm':>4}  category / text")
+usage.current["job"] = "measure"
+print(f"{'split':6} {'label':5} {'regex':5} {'llm':>4}  {'status':6}  category / text")
 for split, actual, category, text in cases:
-    regex_flag = len(find_pii_with_regex(text)) > 0
-    llm_score, _, _ = ask_guard_llm(text)
+    hits = find_pii_with_regex(text)
+    regex_flag = len(hits) > 0
+    if use_cache and text in cache:
+        llm_score = cache[text]
+    else:
+        llm_score, _, _ = ask_guard_llm(text)
+        cache[text] = llm_score
+        time.sleep(3)  # the 120b model allows 8000 tokens per minute; each check uses about 400
     llm_flag = llm_score >= PII_THRESHOLD
-    combined_flag = regex_flag or llm_flag  # the rule pii_job.py uses: regex hit, else the guard
+    status = triage_status(hits, llm_score)  # the same rule pii_job.py uses
     count(split, "regex", regex_flag, actual)
     count(split, "llm", llm_flag, actual)
-    count(split, "combined", combined_flag, actual)
+    count(split, "queue", status is not None, actual)   # anything a human will look at
+    count(split, "high", status == "open", actual)      # only the high-priority part (drives alerts)
     mark = ""
-    if combined_flag != actual:
-        mark = "  <-- " + ("MISSED LEAK" if actual else "FALSE ALARM")
-        mistakes.append((split, category, "MISSED LEAK" if actual else "FALSE ALARM", regex_flag, llm_score))
-    print(f"{split:5} {str(actual):5} {str(regex_flag):5} {llm_score:4.2f}  {category}: {text[:48]!r}{mark}", flush=True)
-    time.sleep(3)  # the 120b model allows 8000 tokens per minute; each check uses about 350
+    if actual and status is None:
+        mark = "  <-- MISSED LEAK"
+        mistakes.append((split, category, "MISSED LEAK", regex_flag, llm_score))
+    elif not actual and status == "open":
+        mark = "  <-- FALSE ALARM (high)"
+        mistakes.append((split, category, "FALSE ALARM", regex_flag, llm_score))
+    elif not actual and status == "review":
+        mark = "  (review noise)"
+        mistakes.append((split, category, "review noise", regex_flag, llm_score))
+    print(f"{split:6} {str(actual):5} {str(regex_flag):5} {llm_score:4.2f}  {str(status):6}  {category}: {text[:44]!r}{mark}", flush=True)
+
+if not use_cache:
+    json.dump(cache, open(CACHE_FILE, "w"), indent=1)
 
 print()
 for split, detectors in counts.items():
     for name, (tp, fp, fn, tn) in detectors.items():
         precision = tp / (tp + fp) if tp + fp else 0
         recall = tp / (tp + fn) if tp + fn else 0
-        print(f"{split:5} {name:9} tp={tp:2} fp={fp:2} fn={fn:2} tn={tn:2}  precision={precision:.2f} recall={recall:.2f}")
+        print(f"{split:6} {name:6} tp={tp:2} fp={fp:2} fn={fn:2} tn={tn:2}  precision={precision:.2f} recall={recall:.2f}")
 
-print("\nMISTAKES OF THE COMBINED CHECK:")
+usage.flush()
+print("\nMISTAKES AND NOISE (queue = open + review; high = open only):")
 for split, category, kind, regex_flag, llm_score in mistakes:
     print(f"  [{split}] {kind:12} {category:22} regex={regex_flag} llm={llm_score:.2f}")

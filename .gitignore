@@ -1,3 +1,31 @@
+# ---- secrets: never commit API keys
 .env
+.env.*
+!.env.example
+!.env.compose
+
+# ---- Python
 .venv/
-docs
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- created by tools we use
+.deepeval/
+.deepeval-cache.json
+.deepeval_telemetry.txt
+
+# ---- editor, OS, logs
+.vscode/
+.idea/
+.DS_Store
+*.log
+nohup.out
+
+# ---- your personal learning notes (kept out of git on purpose)
+docs/

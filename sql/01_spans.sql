@@ -1,11 +1,9 @@
 -- The collector writes raw spans into otel.otel_traces.
 -- We copy each new span into our own table "spans" with the columns we care about.
+-- Safe to run again: nothing is dropped. Needs otel.otel_traces to exist, which the collector
+-- creates when it first starts (so run `make up`, wait a few seconds, then `make schema`).
 
-DROP VIEW IF EXISTS otel.spans;           -- old view from before
-DROP VIEW IF EXISTS otel.spans_mv;
-DROP TABLE IF EXISTS otel.spans;
-
-CREATE TABLE otel.spans
+CREATE TABLE IF NOT EXISTS otel.spans
 (
     start_time            DateTime64(9),
     trace_id              String,
@@ -32,7 +30,7 @@ ORDER BY (app_id, start_time);
 
 -- Runs on every insert into otel_traces and fills "spans".
 -- Different SDK versions use different attribute names, so we try the new name, then the old one.
-CREATE MATERIALIZED VIEW otel.spans_mv TO otel.spans AS
+CREATE MATERIALIZED VIEW IF NOT EXISTS otel.spans_mv TO otel.spans AS
 SELECT
     Timestamp                                    AS start_time,
     TraceId                                      AS trace_id,

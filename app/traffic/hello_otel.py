@@ -1,3 +1,4 @@
+# Step 1: one traced LLM call. Run with `make hello`, then look at the span in ClickHouse.
 import os
 
 from openai import OpenAI
@@ -13,10 +14,14 @@ Traceloop.init(
     disable_batch=True,  # send immediately; fine for a demo
 )
 
-client = OpenAI(base_url=os.environ["LLM_BASE_URL"], api_key=os.environ["LLM_API_KEY"])
+# Groq by default; the key comes from GROQ_API_KEY in .env (run it with `make hello`).
+client = OpenAI(
+    base_url=os.environ.get("LLM_BASE_URL", "https://api.groq.com/openai/v1"),
+    api_key=os.environ.get("LLM_API_KEY") or os.environ["GROQ_API_KEY"],
+)
 
 resp = client.chat.completions.create(
-    model=os.environ["LLM_MODEL"],
+    model=os.environ.get("LLM_MODEL", "openai/gpt-oss-20b"),
     messages=[{"role": "user", "content": "Say hello in five words."}],
 )
 print(resp.choices[0].message.content)

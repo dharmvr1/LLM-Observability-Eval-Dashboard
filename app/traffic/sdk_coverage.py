@@ -3,9 +3,19 @@
 import os
 
 from traceloop.sdk import Traceloop
+from traceloop.sdk.instruments import Instruments
 
 os.environ["TRACELOOP_METRICS_ENABLED"] = "false"
-Traceloop.init(app_name="sdk-coverage", api_endpoint="http://localhost:4318", disable_batch=True)
+# LlamaIndex's own instrumentor is switched off on purpose: with it on, the spans have no model
+# name, and for llm.complete() no tokens or text at all. With it off, a LlamaIndex call is traced by
+# the OpenAI instrumentor underneath, which gives a complete span. We tag each test with an
+# "sdk_family" property below, so the family can still be told apart in the data.
+Traceloop.init(
+    app_name="sdk-coverage",
+    api_endpoint="http://localhost:4318",
+    disable_batch=True,
+    instruments={i for i in Instruments if i != Instruments.LLAMA_INDEX},
+)
 
 # Tag every span from this script with a user id (shows up in the user_id column).
 Traceloop.set_association_properties({"user_id": "u_42"})
@@ -14,9 +24,11 @@ PROMPT = "Say hello in five words."
 
 # Groq and OpenRouter both speak the OpenAI protocol, so we use them for
 # the OpenAI, LangChain, LlamaIndex and vLLM-style tests.
-BASE_URL = "https://api.groq.com/openai/v1"
-MODEL = "openai/gpt-oss-20b"
-API_KEY = os.environ.get("GROQ_API_KEY", "")
+# Defaults to Groq. To use the local freellmapi gateway instead:
+#   COVERAGE_BASE_URL=http://localhost:3001/v1 COVERAGE_MODEL=gpt-oss-20b COVERAGE_API_KEY=$FREELLMAPI_KEY
+BASE_URL = os.environ.get("COVERAGE_BASE_URL", "https://api.groq.com/openai/v1")
+MODEL = os.environ.get("COVERAGE_MODEL", "openai/gpt-oss-20b")
+API_KEY = os.environ.get("COVERAGE_API_KEY") or os.environ.get("GROQ_API_KEY", "")
 
 
 def test_openai():
@@ -34,11 +46,12 @@ def test_anthropic():
     # Anthropic SDK still gets exercised (and instrumented) with an OpenRouter key.
     client = Anthropic(base_url="https://openrouter.ai/api", auth_token=os.environ["OPENROUTER_API_KEY"])
     r = client.messages.create(
-        model=os.environ.get("OPENROUTER_MODEL", "google/gemma-4-26b-a4b-it:free"),
+        model=os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3.5-lightning:free"),
         max_tokens=50,
         messages=[{"role": "user", "content": PROMPT}],
     )
-    return r.content[0].text
+    # Some models answer with a "thinking" block first, which has no .text.
+    return "".join(block.text for block in r.content if block.type == "text") or f"blocks: {[b.type for b in r.content]}"
 
 
 def test_google():
@@ -89,6 +102,7 @@ for name, (function, needs) in tests.items():
     if not os.environ.get(needs):
         print(f"{name:12} SKIPPED (set {needs})")
         continue
+    Traceloop.set_association_properties({"user_id": "u_42", "sdk_family": name})
     try:
         print(f"{name:12} OK: {function()!r}")
     except Exception as e:

@@ -9,6 +9,8 @@ import time
 
 from openai import OpenAI
 
+from app.lib import usage
+
 # gpt-oss-safeguard-20b is allowed only 2000 tokens/min on the free tier, so we use the 120b model.
 PII_JUDGE_MODEL = os.environ.get("PII_JUDGE_MODEL", "openai/gpt-oss-120b")
 PII_THRESHOLD = 0.7  # risk at or above this goes to the triage queue
@@ -25,6 +27,15 @@ EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 PHONE = re.compile(r"(?<!\d)(?:\+?1[\s.-]?)?(?!8(?:00|33|44|55|66|77|88))\(?\d{3}\)?[\s.-]\d{3}[\s.-]\d{4}(?!\d)")
 CARD = re.compile(r"(?<!\d)(?:\d[ -]?){13,16}(?!\d)")
 
+
+# Spelled-out emails such as "jane dot roe at example dot com" or "j4ne.r0e [at] example [dot] com".
+# The guard LLM was unreliable on these (5 detections in 17 runs of the same text), so we match them here.
+AT = r"(?:\s*[\[\(]\s*at\s*[\]\)]\s*|\s+at\s+)"
+DOT = r"(?:\s*[\[\(]\s*dot\s*[\]\)]\s*|\s+dot\s+)"
+OBFUSCATED_EMAIL = re.compile(
+    r"[A-Za-z0-9._%+-]+(?:" + DOT + r"[A-Za-z0-9_%+-]+)*" + AT + r"[A-Za-z0-9-]+(?:" + DOT + r"[A-Za-z0-9-]+)+",
+    re.IGNORECASE,
+)
 
 # Role mailboxes belong to a company, not to a person, so they are not a leak.
 ROLE_MAILBOXES = {"info", "support", "contact", "sales", "help", "hello", "admin", "noreply", "no-reply", "press", "billing"}
@@ -51,6 +62,8 @@ def find_pii_with_regex(text):
     for m in EMAIL.finditer(text):
         if m.group().split("@")[0].lower() not in ROLE_MAILBOXES:
             hits.append(("email", m.group()))
+    for m in OBFUSCATED_EMAIL.finditer(text):
+        hits.append(("email-obfuscated", m.group()))
     for m in PHONE.finditer(text):
         hits.append(("phone", m.group()))
     for m in CARD.finditer(text):
@@ -77,6 +90,7 @@ def ask_guard_llm(text):
                 response_format={"type": "json_object"},
                 messages=[{"role": "user", "content": GUARD_PROMPT + text[:2000]}],
             )
+            usage.record(PII_JUDGE_MODEL, r.usage)
             data = json.loads(r.choices[0].message.content)
             score = min(1.0, max(0.0, float(data["score"])))
             return score, list(data.get("types", [])), str(data.get("reason", ""))
@@ -84,6 +98,31 @@ def ask_guard_llm(text):
             print(f"   guard retry {attempt + 1}: {type(e).__name__}")
             time.sleep(10 * (attempt + 1))
     raise RuntimeError("guard LLM failed 3 times")
+
+
+# SSN and card matches are specific enough to flag on their own. Emails and phone numbers are not
+# (placeholders, company lines), so for those the guard LLM makes the call.
+HARD_TYPES = {"ssn", "card"}
+
+
+def is_hard_hit(hits):
+    return any(kind in HARD_TYPES for kind, _ in hits)
+
+
+# Triage status for a response (None = nothing to review):
+#   open    high priority: a hard match (SSN, card) or the guard scored >= PII_THRESHOLD
+#   review  low priority: an email/phone matched the regex but the guard did not confirm it.
+#           It is kept (a person's real email was once dismissed by the guard), but it should
+#           not trigger alerts.
+REVIEW_RISK = 0.5
+
+
+def triage_status(hits, llm_score):
+    if is_hard_hit(hits) or llm_score >= PII_THRESHOLD:
+        return "open"
+    if hits:
+        return "review"
+    return None
 
 
 def mask_digits(text):
