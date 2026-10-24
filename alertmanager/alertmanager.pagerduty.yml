@@ -1,0 +1,53 @@
+# Alertmanager, variant 2: Slack for warnings; critical alerts go to PagerDuty AND Slack.
+# (Used when PAGERDUTY_ROUTING_KEY is set in .env.)
+# Every alert is also sent to the local receiver, which stores it in otel.alert_events.
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: slack-warning          # anything not matched below
+  group_by: [alertname, app_id]    # alerts with the same name and app are sent as one message
+  group_wait: 10s                  # wait this long for more alerts of a group before the first message
+  group_interval: 1m
+  repeat_interval: 4h              # remind every 4 hours while still firing
+  routes:
+    - receiver: local-log          # the history for the dashboard; "continue" lets the next route run too
+      continue: true
+    - matchers: ['severity="critical"']
+      receiver: critical
+    # Everything else (warnings). This must be an explicit route: the top-level `receiver` is used only
+    # when NO sub-route matched, and the local-log route above matches every alert.
+    - receiver: slack-warning
+
+# A critical alert silences the warning about the same thing (same `family`).
+inhibit_rules:
+  - source_matchers: ['severity="critical"']
+    target_matchers: ['severity="warning"']
+    equal: ['family']
+
+receivers:
+  - name: slack-warning
+    slack_configs:
+      - send_resolved: true
+        api_url_file: /etc/alertmanager/secrets/slack_url
+        title: '{{ if eq .Status "firing" }}WARNING{{ else }}RESOLVED{{ end }}: {{ .CommonLabels.alertname }}'
+        title_link: http://127.0.0.1:3100/alerts
+        text: '{{ range .Alerts }}• {{ .Annotations.summary }}{{ "\n" }}{{ end }}'
+        color: '{{ if eq .Status "firing" }}warning{{ else }}good{{ end }}'
+  - name: critical
+    slack_configs:
+      - send_resolved: true
+        api_url_file: /etc/alertmanager/secrets/slack_url
+        title: '{{ if eq .Status "firing" }}CRITICAL{{ else }}RESOLVED{{ end }}: {{ .CommonLabels.alertname }}'
+        title_link: http://127.0.0.1:3100/alerts
+        text: '{{ range .Alerts }}• {{ .Annotations.summary }}{{ "\n" }}{{ end }}'
+        color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+    pagerduty_configs:
+      - send_resolved: true
+        routing_key_file: /etc/alertmanager/secrets/pagerduty_key
+        severity: critical
+        description: '{{ .CommonLabels.alertname }}: {{ range .Alerts }}{{ .Annotations.summary }} {{ end }}'
+  - name: local-log
+    webhook_configs:
+      - url: http://127.0.0.1:9199/
+        send_resolved: true

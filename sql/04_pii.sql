@@ -31,4 +31,6 @@ CREATE TABLE IF NOT EXISTS otel.pii_triage
     status           LowCardinality(String) DEFAULT 'open'    -- open (high) | review (low, regex-only) | confirmed | false_positive
 )
 ENGINE = MergeTree
-ORDER BY (status, created_at);
+-- status is NOT in the sort key: ClickHouse cannot UPDATE a column that is part of ORDER BY,
+-- and a person changes `status` from the dashboard.
+ORDER BY (created_at, trace_id, span_id);

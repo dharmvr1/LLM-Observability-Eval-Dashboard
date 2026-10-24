@@ -1,5 +1,6 @@
 services:
   clickhouse:
+    restart: unless-stopped   # come back after a Docker daemon restart or a reboot
     image: clickhouse/clickhouse-server:24.8
     environment:
       CLICKHOUSE_DB: otel
@@ -17,6 +18,7 @@ services:
 
   # Local fake S3. The "raw event archive" from the README goes here.
   s3:
+    restart: unless-stopped   # come back after a Docker daemon restart or a reboot
     image: adobe/s3mock:latest
     environment:
       COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: raw-events
@@ -24,6 +26,7 @@ services:
       - "9090:9090"   # S3 API (http)
 
   otel-collector:
+    restart: unless-stopped   # come back after a Docker daemon restart or a reboot
     image: otel/opentelemetry-collector-contrib:0.111.0
     command: ["--config=/etc/otel/config.yaml"]
     environment:
@@ -41,5 +44,35 @@ services:
       s3:
         condition: service_started
 
+  # Step 8: alerting. Both run on the host network and listen on 127.0.0.1 only, so the exporter
+  # (127.0.0.1:9108) and the alert receiver (127.0.0.1:9199) never have to be open to your network.
+  # (Host networking works on Linux only.) Port 9090 is taken by the fake S3, so Prometheus uses 9091.
+  prometheus:
+    restart: unless-stopped   # come back after a Docker daemon restart or a reboot
+    image: prom/prometheus:v2.55.1
+    network_mode: host
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --web.listen-address=127.0.0.1:9091
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - prometheus-data:/prometheus
+
+  alertmanager:
+    restart: unless-stopped   # come back after a Docker daemon restart or a reboot
+    image: prom/alertmanager:v0.27.0
+    network_mode: host
+    command:
+      - --config.file=/etc/alertmanager/active.yml   # written by `make alerts-config`
+      - --web.listen-address=127.0.0.1:9093
+      - --cluster.listen-address=                    # no clustering, so no extra open port
+      - --storage.path=/alertmanager
+    volumes:
+      - ./alertmanager:/etc/alertmanager:ro
+      - alertmanager-data:/alertmanager
+
 volumes:
+  prometheus-data:
+  alertmanager-data:
   clickhouse-data:

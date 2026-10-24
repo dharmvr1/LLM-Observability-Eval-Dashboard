@@ -1,0 +1,95 @@
+# When is something wrong? Each rule is a question asked every 15 seconds. `for:` is how long the answer
+# must stay "yes" before the alert fires (0m = at once). `family` groups alerts about the same thing, so
+# a critical alert can silence the warning about the same problem (see inhibit_rules in alertmanager/).
+groups:
+  - name: privacy
+    rules:
+      # One alert per app (the metric has an app_id label), so a leak in one app is a NEW alert even while
+      # another app's leak is still unresolved.
+      - alert: PIILeakOpen
+        expr: pii_triage_items{status="open"} > 0
+        for: 0m
+        labels: {severity: critical, family: pii}
+        annotations:
+          summary: "{{ $labels.app_id }}: {{ $value }} unresolved high-priority PII item(s) in the triage queue"
+          description: "Open them at http://127.0.0.1:3100/alerts and mark each one confirmed or a false alarm."
+
+  - name: answer-quality
+    rules:
+      # Only judge a metric once it has at least 5 scores, otherwise one bad answer would page someone.
+      - alert: FaithfulnessCritical
+        expr: eval_score_mean_1h{metric="faithfulness"} < 0.5 and eval_scored_1h{metric="faithfulness"} >= 5
+        for: 5m
+        labels: {severity: critical, family: faithfulness}
+        annotations:
+          summary: "Faithfulness is {{ $value | printf \"%.2f\" }} over the last hour (critical below 0.5)"
+      - alert: FaithfulnessLow
+        expr: eval_score_mean_1h{metric="faithfulness"} < 0.8 and eval_scored_1h{metric="faithfulness"} >= 5
+        for: 5m
+        labels: {severity: warning, family: faithfulness}
+        annotations:
+          summary: "Faithfulness is {{ $value | printf \"%.2f\" }} over the last hour (warning below 0.8)"
+      - alert: AnswerRelevancyLow
+        expr: eval_score_mean_1h{metric="answer_relevancy"} < 0.7 and eval_scored_1h{metric="answer_relevancy"} >= 5
+        for: 5m
+        labels: {severity: warning, family: relevancy}
+        annotations:
+          summary: "Answer relevancy is {{ $value | printf \"%.2f\" }} over the last hour (warning below 0.7)"
+      - alert: ToxicityFailing
+        expr: eval_failed_1h{metric="toxicity"} / eval_scored_1h{metric="toxicity"} > 0.05 and eval_scored_1h{metric="toxicity"} >= 5
+        for: 5m
+        labels: {severity: warning, family: toxicity}
+        annotations:
+          summary: "{{ $value | humanizePercentage }} of answers failed the toxicity check in the last hour (warning above 5%)"
+
+  - name: traffic
+    rules:
+      - alert: LatencyP95High
+        expr: llm_latency_ms{quantile="0.95"} > 5000 and on(app_id) llm_calls_15m >= 5
+        for: 5m
+        labels: {severity: warning, family: latency}
+        annotations:
+          summary: "{{ $labels.app_id }}: p95 latency is {{ $value | printf \"%.0f\" }} ms over the last 15 minutes (warning above 5000 ms)"
+      - alert: ErrorRateCritical
+        expr: llm_errors_15m / llm_calls_15m > 0.5 and on(app_id) llm_calls_15m >= 5
+        for: 5m
+        labels: {severity: critical, family: errors}
+        annotations:
+          summary: "{{ $labels.app_id }}: {{ $value | humanizePercentage }} of LLM calls are failing (critical above 50%)"
+      - alert: ErrorRateHigh
+        expr: llm_errors_15m / llm_calls_15m > 0.1 and on(app_id) llm_calls_15m >= 5
+        for: 5m
+        labels: {severity: warning, family: errors}
+        annotations:
+          summary: "{{ $labels.app_id }}: {{ $value | humanizePercentage }} of LLM calls are failing (warning above 10%)"
+
+  - name: drift-and-budget
+    rules:
+      # 'ALL' mixes every app, including the fake drift-demo apps, so it is not alerted on.
+      - alert: DriftDetected
+        expr: drift_alert{app_id!~"drift-demo-.*|ALL"} == 1
+        for: 0m
+        labels: {severity: warning, family: drift}
+        annotations:
+          summary: "{{ $labels.app_id }}: the kind of prompt has changed (PSI above 0.2)"
+      - alert: JudgeTokenBudgetHigh
+        expr: judge_tokens_24h / scalar(judge_token_budget) > 0.8
+        for: 5m
+        labels: {severity: warning, family: budget}
+        annotations:
+          summary: "Judge model {{ $labels.model }} used {{ $value | humanizePercentage }} of its daily token budget"
+
+  - name: monitoring
+    rules:
+      - alert: ExporterDown
+        expr: up{job="llm-exporter"} == 0
+        for: 1m
+        labels: {severity: critical, family: monitoring}
+        annotations:
+          summary: "Prometheus cannot reach the metrics exporter (run `make exporter`)"
+      - alert: ExporterStale
+        expr: time() - exporter_last_success_timestamp_seconds > 120
+        for: 0m
+        labels: {severity: critical, family: monitoring}
+        annotations:
+          summary: "The exporter has not read ClickHouse successfully for over 2 minutes"

@@ -82,8 +82,12 @@ def check_group(app_id, rows, boundary, now):
           f"psi={value:6.3f}  {verdict}")
     if alert:
         print(f"{'':20} {note}")
-    baseline_start = boundary - datetime.timedelta(days=BASELINE_DAYS)
-    return [app_id, baseline_start, boundary, boundary, now,
+    # ClickHouse gives datetimes back without a timezone (it runs in UTC). When we insert them again,
+    # clickhouse-connect would read a datetime without timezone as LOCAL time and shift it by this
+    # machine's offset (5h30 here). So say "UTC" at the moment of inserting.
+    utc = datetime.timezone.utc
+    baseline_start = (boundary - datetime.timedelta(days=BASELINE_DAYS)).replace(tzinfo=utc)
+    return [app_id, baseline_start, boundary.replace(tzinfo=utc), boundary.replace(tzinfo=utc), now.replace(tzinfo=utc),
             len(baseline_texts), len(current_texts), value, PSI_THRESHOLD, alert, note]
 
 
