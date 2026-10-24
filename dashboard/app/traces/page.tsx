@@ -1,5 +1,5 @@
 import Link from "next/link";
-import { StatusBadge, Toolbar } from "@/components/Ui";
+import { Empty, PageHead, StatusBadge, Toolbar } from "@/components/Ui";
 import { query } from "@/lib/db";
 import { lastMessage, maskSensitive, ms, num, when } from "@/lib/format";
 import { first, readFilters, spanCondition } from "@/lib/range";
@@ -49,53 +49,50 @@ export default async function Traces({ searchParams }: { searchParams: Promise<R
 
   return (
     <>
-      <h1>Traces</h1>
-      <p className="sub">One row per LLM call, newest first (at most 100). Click a row for the waterfall, the prompt and the scores.</p>
-      <Toolbar path="/traces" filters={filters} extra={extra} />
+      <PageHead title="Traces" subtitle="One row per LLM call, newest first (at most 100). Open a row for the waterfall, the prompt and the scores.">
+        <Toolbar path="/traces" filters={filters} extra={extra} />
+      </PageHead>
 
       <form className="search" action="/traces">
-        <input name="q" defaultValue={q} placeholder="search prompt or answer text" size={30} />
-        <select name="app" defaultValue={app}>
-          <option value="">all apps</option>
+        <input name="q" defaultValue={q} placeholder="Search prompt or answer text" size={32} aria-label="Search text" />
+        <select name="app" defaultValue={app} aria-label="App">
+          <option value="">All apps</option>
           {apps.map((a) => <option key={a.app_id} value={a.app_id}>{a.app_id}</option>)}
         </select>
-        <input name="user" defaultValue={user} placeholder="user id" size={10} />
-        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
-          <input type="checkbox" name="errors" value="1" defaultChecked={onlyErrors} /> errors only
+        <input name="user" defaultValue={user} placeholder="User id" size={10} aria-label="User id" />
+        <label style={{ display: "flex", gap: 6, alignItems: "center", color: "var(--ink-2)" }}>
+          <input type="checkbox" name="errors" value="1" defaultChecked={onlyErrors} /> Errors only
         </label>
         <input type="hidden" name="range" value={filters.range} />
         {filters.demo ? <input type="hidden" name="demo" value="1" /> : null}
         <button className="primary" type="submit">Search</button>
       </form>
 
-      <div className="card">
-        {rows.length === 0 ? (
-          <div className="empty">No calls match.</div>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>Time</th><th>App</th><th>User</th><th>Model</th><th className="num">Latency</th>
-                <th className="num">Tokens</th><th>Status</th><th>Prompt</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((r, i) => (
-                <tr key={`${r.trace_id}-${i}`}>
-                  <td className="mono" style={{ whiteSpace: "nowrap" }}><Link href={`/traces/${r.trace_id}`}>{when(r.started)}</Link></td>
-                  <td>{r.app_id}</td>
-                  <td>{r.user_id || "-"}</td>
-                  <td>{r.model}</td>
-                  <td className="num">{ms(r.latency_ms)}</td>
-                  <td className="num">{num(r.tin + r.tout)}</td>
-                  <td><StatusBadge status={r.status} /></td>
-                  <td className="clip" title={maskSensitive(lastMessage(r.input, "user"))}>{maskSensitive(lastMessage(r.input, "user")) || "-"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+      <section className="card">
+        {rows.length === 0 ? <Empty title="No calls match" hint="Try a wider time range or fewer filters." /> : (
+          <div className="scroll-x">
+            <table>
+              <thead>
+                <tr><th>Time</th><th>App</th><th>User</th><th>Model</th><th className="num">Latency</th><th className="num">Tokens</th><th>Status</th><th>Prompt</th></tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={`${r.trace_id}-${i}`}>
+                    <td className="mono nowrap"><Link href={`/traces/${r.trace_id}`}>{when(r.started)}</Link></td>
+                    <td>{r.app_id}</td>
+                    <td>{r.user_id || <span className="muted">-</span>}</td>
+                    <td>{r.model}</td>
+                    <td className="num">{ms(r.latency_ms)}</td>
+                    <td className="num">{num(r.tin + r.tout)}</td>
+                    <td><StatusBadge status={r.status} /></td>
+                    <td className="clip" title={maskSensitive(lastMessage(r.input, "user"))}>{maskSensitive(lastMessage(r.input, "user")) || <span className="muted">-</span>}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
-      </div>
+      </section>
     </>
   );
 }

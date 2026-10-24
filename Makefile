@@ -21,7 +21,7 @@ CLICKHOUSE := docker compose exec -T clickhouse clickhouse-client --user default
 .DEFAULT_GOAL := help
 .PHONY: help up down ps schema query hello coverage traffic traffic-pii traffic-drift traffic-drift-clean \
         eval pii pii-loop exporter receiver start stop status alerts-config alerts-test drift dashboard-install dashboard dashboard-build dashboard-start \
-        measure-eval measure-pii measure-pii-cached noise-check check-docs probe clean
+        measure-eval measure-pii measure-pii-cached noise-check check-docs probe scale-test clean
 
 help:  ## show this list
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  make %-20s %s\n", $$1, $$2}'
@@ -139,6 +139,11 @@ measure-pii-cached:  ## same, but reuse the saved guard scores (0 tokens)
 
 noise-check:  ## how often does PSI exceed 0.2 when nothing changed?
 	@$(ENV) $(PY) -m app.measure.drift_noise_check
+
+RATE ?= 1000
+SECONDS_STEADY ?= 120
+scale-test:  ## README scale criterion: send RATE spans/s for SECONDS_STEADY seconds and look for a backlog (e.g. make scale-test RATE=2000)
+	@$(ENV) $(PY) -u -m app.measure.scale_test --rate $(RATE) --seconds $(SECONDS_STEADY)
 
 TRIALS ?= 1
 probe:  ## step 9: deploy a fake bug (1% of answers leak a fake SSN) and time the alert; TRIALS=3 for several runs (sends real Slack messages)

@@ -7,8 +7,8 @@ services:
       CLICKHOUSE_USER: default
       CLICKHOUSE_PASSWORD: dev
     ports:
-      - "8123:8123"   # HTTP (curl / Python)
-      - "9000:9000"   # native (the collector uses this)
+      - "127.0.0.1:8123:8123"   # HTTP (curl / Python). Loopback only: the password is "dev"
+      - "127.0.0.1:9000:9000"   # native protocol (the collector reaches it by service name; this is for a local client)
     volumes:
       - clickhouse-data:/var/lib/clickhouse
     healthcheck:
@@ -23,7 +23,7 @@ services:
     environment:
       COM_ADOBE_TESTING_S3MOCK_STORE_INITIAL_BUCKETS: raw-events
     ports:
-      - "9090:9090"   # S3 API (http)
+      - "127.0.0.1:9090:9090"   # S3 API (http), loopback only
 
   otel-collector:
     restart: unless-stopped   # come back after a Docker daemon restart or a reboot
@@ -37,7 +37,8 @@ services:
     volumes:
       - ./collector/config.yaml:/etc/otel/config.yaml:ro
     ports:
-      - "4318:4318"   # OTLP HTTP
+      - "127.0.0.1:4318:4318"   # OTLP HTTP, loopback only (it accepts spans from anyone who can reach it)
+      - "127.0.0.1:8888:8888"   # the collector's own metrics (queue sizes, refused spans), read by Prometheus
     depends_on:
       clickhouse:
         condition: service_healthy

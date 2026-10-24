@@ -71,6 +71,9 @@ exporters:
       disable_ssl: true
 
 service:
+  telemetry:
+    metrics:
+      address: 0.0.0.0:8888   # the collector's own metrics, mapped to 127.0.0.1:8888 in docker-compose.yml
   pipelines:
     # Sampled spans go to ClickHouse for analytics.
     traces:
