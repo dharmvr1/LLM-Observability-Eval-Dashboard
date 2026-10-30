@@ -1,143 +1,154 @@
-# Capstone 11 — LLM Observability & Eval Dashboard
+# LLM Observability & Eval Dashboard
 
-> Langfuse went open-core. Arize Phoenix published the 2026 GenAI semconv mappings. Helicone and Braintrust both doubled down on per-user cost attribution. Traceloop's OpenLLMetry became the de-facto SDK instrumentation. The production shape is ClickHouse for traces, Postgres for metadata, Next.js for UI, and a small army of eval jobs (DeepEval, RAGAS, LLM-judge) running over sampled traces. Build one self-hosted, ingest from at least four SDK families, and demonstrate catching an injected regression in under five minutes.
+A self-hosted observability plane for LLM applications: it ingests OpenTelemetry traces from
+instrumented apps, stores them in ClickHouse, runs batch **eval / PII / drift** jobs over recent
+traffic, and raises alerts — all surfaced in a Next.js dashboard. The headline test: a deliberately
+injected regression (a bot that starts leaking fake SSNs) is caught and alerted in **under 5 minutes**.
 
+Built as Capstone 11. The original brief is preserved at the [bottom of this file](#original-capstone-brief);
+this README describes what was actually built.
 
+---
 
-## Problem
+## What it does
 
-Every AI team running production traffic in 2026 keeps an observability plane alongside the model. Cost attribution. Hallucination detection. Drift monitoring. Jailbreak signal. SLO dashboards. PII leak alerts. The open-source references — Langfuse, Phoenix, OpenLLMetry — converged on OpenTelemetry GenAI semantic conventions as the ingest schema. You can now instrument OpenAI, Anthropic, Google, LangChain, LlamaIndex, and vLLM with one SDK and ship compatible spans.
+- **Ingest** GenAI-semconv spans over OTLP HTTP, tail-sample them (keep 100% of errors + anything
+  that looks like a PII leak, 10% of the rest), and fan out to ClickHouse + an S3 archive.
+- **Score answer quality** with DeepEval (faithfulness, answer-relevancy, toxicity) over the last
+  15 minutes of traffic, writing scores back to ClickHouse.
+- **Catch PII leaks** with a zero-token regex pass first, then an optional LLM guard, feeding a
+  two-tier triage queue (open / review).
+- **Detect prompt drift** with PSI on sentence-transformer embeddings of prompts, per app.
+- **Alert** through Prometheus → Alertmanager → Slack / PagerDuty, and measure time-to-alert with a
+  built-in regression probe.
+- **Explore** everything — traces, cost per user, latency, eval trends, drift, alert history — in a
+  Next.js 15 dashboard.
 
-You will build a self-hosted dashboard that ingests from at least four SDK families, runs a small set of eval jobs over sampled traces, detects drift, and alerts. The measurement bar: given a deliberately injected regression (a prompt that starts producing PII), the dashboard catches it and fires an alert in under five minutes.
+---
 
-## Concept
+## Screenshots
 
-Ingest is OTLP HTTP. The SDK produces GenAI-semconv spans: `gen_ai.system`, `gen_ai.request.model`, `gen_ai.usage.input_tokens`, `gen_ai.response.id`, `llm.prompts`, `llm.completions`. Spans land in ClickHouse for columnar analytics; metadata (users, sessions, apps) lands in Postgres.
+**Overview** — calls, tokens, cost per user, latency, and a plain-language health row.
 
-Evals run as batch jobs over sampled traces. DeepEval scores faithfulness, toxicity, and answer relevance. RAGAS scores retrieval metrics when the trace carries retrieval context. Custom LLM-judges run domain-specific checks (PII leak, off-policy response). Eval runs write back to the same ClickHouse as eval spans linked to the parent trace.
+![Overview](screenshots/01-overview.png)
 
-Drift detection watches embedding-space distributions over time (PSI or KL divergence on prompt embeddings) plus eval-score trends. Alerts feed Prometheus Alertmanager and then Slack / PagerDuty. The UI is Next.js 15 with Recharts.
+**Evals** — DeepEval scores with the judge's reasoning on failures (here, two faithfulness fails
+where the bot made claims the context didn't support).
+
+![Evals](screenshots/02-evals.png)
+
+**Traces** — one row per LLM call; open a row for the waterfall, prompt, answer, and scores.
+
+![Traces](screenshots/03-traces.png)
+
+<details>
+<summary>More screenshots — Drift, Alerts, Reliability</summary>
+
+**Drift** — PSI per app over time against a trailing baseline.
+
+![Drift](screenshots/04-drift.png)
+
+**Alerts** — the firing/resolved history recorded by the local alert receiver, plus the PII triage queue.
+
+![Alerts](screenshots/05-alerts.png)
+
+**Reliability** — the regression-probe results: time from a deployed bug to a Slack alert.
+
+![Reliability](screenshots/06-reliability.png)
+
+</details>
+
+---
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    subgraph apps["Instrumented apps (OpenLLMetry)"]
+        A["support-bot · lookup-bot · drift gen<br/>OpenAI · Anthropic · Google · LangChain SDKs"]
+    end
+    A -- "OTLP HTTP :4318" --> C["OTel Collector<br/>tail-sampling + fan-out"]
+    C --> CH[("ClickHouse<br/>spans + derived tables")]
+    C --> S3[("S3 archive<br/>raw events")]
+
+    subgraph jobs["Batch jobs (Python)"]
+        E["eval_job<br/>DeepEval: faithfulness,<br/>relevancy, toxicity"]
+        P["pii_job<br/>regex + optional LLM guard"]
+        D["drift_job<br/>PSI on prompt embeddings"]
+    end
+    CH --> E --> CH
+    CH --> P --> CH
+    CH --> D --> CH
+
+    CH --> X["metrics_exporter :9108"]
+    X --> PR["Prometheus :9091"]
+    PR --> AM["Alertmanager :9093"]
+    AM --> SL["Slack / PagerDuty"]
+    AM --> RC["alert_receiver :9199"] --> CH
+
+    CH --> UI["Next.js 15 dashboard :3100<br/>server components → ClickHouse HTTP"]
 ```
-production apps:
-  OpenAI SDK  +  Anthropic SDK  +  Google GenAI SDK
-  LangChain + LlamaIndex + vLLM
-       |
-       v
-  OpenTelemetry SDK with GenAI semconv
-       |
-       v  OTLP HTTP
-  collector (ingest, sample, fan-out)
-       |
-       +-------------+-----------+
-       v             v           v
-   ClickHouse    Postgres    S3 archive
-   (spans)       (metadata)  (raw events)
-       |
-       +---> eval jobs (DeepEval, RAGAS, LLM-judge)
-       |     sampled or all-trace
-       |     write eval spans back
-       |
-       +---> drift detector (PSI / KL on prompt embeddings)
-       |
-       +---> Prometheus metrics -> Alertmanager -> Slack / PagerDuty
-       |
-       v
-   Next.js 15 dashboard (Recharts)
-```
+
+**How it differs from the brief:** ClickHouse is the only datastore (no Postgres — users/apps/sessions
+live as span attributes); evals are DeepEval + a custom PII judge (no RAGAS/Phoenix); and the SDK
+coverage is OpenAI, Anthropic, Google, and LangChain via OpenLLMetry (LlamaIndex instrumentor is off,
+vLLM untested). The traffic bot calls **Claude Haiku 4.5 on AWS Bedrock** through the native `converse`
+API, with the span enriched by hand so the eval/PII/drift jobs get the tokens and prompt/answer text
+they need.
+
+---
 
 ## Stack
 
-- Ingest: OpenTelemetry SDKs + GenAI semantic conventions; OTLP HTTP transport
-- Collector: OpenTelemetry Collector with tail-sampling processor (for cost control)
-- Storage: ClickHouse for spans, Postgres for metadata, S3 for raw event archive
-- Evals: DeepEval, RAGAS 0.2, Arize Phoenix evaluator pack, custom LLM-judge
-- Drift: PSI / KL on pooled prompt embeddings (sentence-transformers) weekly
-- Alerting: Prometheus Alertmanager -> Slack / PagerDuty
-- UI: Next.js 15 App Router + Recharts + server actions
-- SDKs supported out of the box: OpenAI, Anthropic, Google GenAI, LangChain, LlamaIndex, vLLM
+| Layer | Choice |
+|---|---|
+| Instrumentation | OpenTelemetry + OpenLLMetry (Traceloop), GenAI semantic conventions |
+| Collector | OpenTelemetry Collector (contrib) with tail-sampling, exporting to ClickHouse + S3 |
+| Storage | ClickHouse (spans and all derived tables); S3-mock for the raw-event archive |
+| Evals | DeepEval (faithfulness, answer-relevancy, toxicity); LLM judge on an OpenAI-compatible endpoint (Groq `gpt-oss-20b` by default) |
+| PII | Regex pass + optional LLM guard, two-tier triage queue |
+| Drift | PSI on pooled prompt embeddings (`sentence-transformers`), 5 bins, per app |
+| Alerting | Prometheus → Alertmanager → Slack / PagerDuty, plus a local receiver |
+| UI | Next.js 15 (App Router, server components) + Recharts, reading ClickHouse over HTTP |
 
-```figure
-ce-otel-drift
+---
+
+## Run it
+
+Prereqs: Docker + Docker Compose, Python 3.13 with the project venv, Node for the dashboard, and a
+`.env` (copy `.env.example`) with at least one LLM key.
+
+```bash
+make up && make schema        # start services, create tables
+make traffic                  # send some traced LLM traffic (support bot → Claude Haiku on Bedrock)
+make eval                     # score the recent answers with DeepEval
+make pii                      # check recent answers for PII leaks
+make drift                    # compute prompt drift (PSI)
+
+make dashboard-install        # once
+make dashboard                # http://127.0.0.1:3100
+
+make start                    # exporter + alert receiver + PII loop (background)
+make probe TRIALS=3           # inject the fake-SSN bug and time the Slack alert
+make scale-test RATE=1000     # sustained-ingest check
+
+make help                     # every command
 ```
 
-## Build It
+All service ports bind to `127.0.0.1` only. See the [Makefile](Makefile) for the full list.
 
-1. **Collector config.** OpenTelemetry Collector with the OTLP HTTP receiver, a tail-sampler keeping 100% of errored traces and 10% of successes, and exporters to ClickHouse and S3.
+---
 
-2. **ClickHouse schema.** Table `spans` with columns mirroring GenAI semconv: `gen_ai_system`, `gen_ai_request_model`, `input_tokens`, `output_tokens`, `latency_ms`, `prompt_hash`, `trace_id`, `parent_span_id`, plus JSON bag for long payloads. Add secondary indexes by user_id and app_id.
+## Results
 
-3. **SDK coverage test.** Write a small client app using each SDK (OpenAI, Anthropic, Google, LangChain, LlamaIndex, vLLM) with OpenLLMetry auto-instrument. Verify each produces canonical GenAI spans that land in ClickHouse.
+- **Regression MTTR:** a leaking answer reaches Slack in a **median of ~80 s** across test runs
+  (target: under 5 minutes). The time breaks down across the collector, the PII loop tick, the
+  exporter scrape, rule evaluation, and Alertmanager's group-wait.
+- **Ingest scale:** sustained **1,000 spans/s** (and 3k / 6k in spot checks) with a flat backlog;
+  the analysis jobs, not ingest, are the real bottleneck.
+- **Eval behavior:** on a clean run of the support bot, answer-relevancy and toxicity pass across the
+  board while faithfulness correctly fails the answers that assert facts the context doesn't support,
+  and refusals ("I don't have that information") are detected and excluded from faithfulness.
 
-4. **Eval jobs.** A scheduled job reads last-15-min sampled traces and runs DeepEval faithfulness, toxicity, and answer relevance. Outputs are eval spans linked to the parent trace.
+---
 
-5. **Custom LLM-judge.** A PII-leak judge: given a response, call a guard LLM to score likelihood of PII leak. High-score responses land in a triage queue.
-
-6. **Drift detection.** Weekly job computes PSI between this week's pooled prompt embeddings and the trailing 4-week baseline. If PSI above threshold, alert.
-
-7. **Dashboard.** Next.js 15 with pages: overview (spans/sec, cost/user, p95 latency), traces (search + waterfall), evals (faithfulness trend, toxicity), drift (PSI over time), alerts.
-
-8. **Alerting chain.** Prometheus exporter reads eval score aggregates and latency percentiles; Alertmanager routes to Slack for warnings and PagerDuty for critical breaches.
-
-9. **Regression probe.** Inject a bug: the evaluated chatbot starts leaking fake SSNs 1% of the time. Measure MTTR: from bug deployed to Slack alert.
-
-## Use It
-
-```
-$ curl -X POST https://my-otel-collector/v1/traces -d @trace.json
-[collector]  accepted 1 trace, 3 spans
-[clickhouse] inserted 3 spans (app=chat, user=u_42)
-[eval]       DeepEval faithfulness 0.82, toxicity 0.03
-[drift]      weekly PSI 0.08 (below 0.2 threshold)
-[ui]         live at https://obs.example.com
-```
-
-## Ship It
-
-`outputs/skill-llm-observability.md` is the deliverable. Given an LLM application, the dashboard ingests its traces, runs evals, alerts on drift, and surfaces cost/user breakdown in Next.js.
-
-| Weight | Criterion | How it is measured |
-|:-:|---|---|
-| 25 | Trace-schema coverage | Number of SDK families producing canonical GenAI spans (target: 6+) |
-| 20 | Eval correctness | DeepEval / RAGAS scores vs hand-labeled set |
-| 20 | Dashboard UX | MTTR on injected regression (under 5 minutes target) |
-| 20 | Cost / scale | Sustained ingest at 1k spans/sec without backlog |
-| 15 | Alerting + drift detection | Prometheus/Alertmanager chain exercised end to end |
-| **100** | | |
-
-## Exercises
-
-1. Add custom instrumentation for the Haystack framework. Verify canonical spans land in ClickHouse with faithful `gen_ai.*` attributes.
-
-2. Swap DeepEval for Phoenix evaluators on the same traces. Measure score drift between the two eval engines.
-
-3. Sharpen the drift detector: compute PSI per app-id rather than globally. Show per-app drift trails.
-
-4. Add a "user impact" page: cost-per-user and failure-rate-per-user with sparklines.
-
-5. Build a tail-sampling policy that keeps 100% of traces with toxicity > 0.5 plus a 10% stratified sample of the rest. Measure sampling bias introduced.
-
-## Key Terms
-
-| Term | What people say | What it actually means |
-|------|-----------------|------------------------|
-| GenAI semconv | "OTel LLM attributes" | 2025 OpenTelemetry spec for LLM span attributes (system, model, tokens) |
-| Tail sampling | "Post-trace sample" | Collector decides to keep or drop a trace after it completes (can peek errors) |
-| PSI | "Population stability index" | Drift metric comparing two distributions; > 0.2 typically signals meaningful drift |
-| LLM-judge | "Eval as model" | An LLM scoring another LLM's output on a rubric (faithfulness, toxicity, PII) |
-| Tail-sampling policy | "Keep-rule" | Rule that decides which traces to persist vs drop; errored + sample-rate |
-| Eval span | "Linked eval trace" | Child span carrying an eval score linked to the original LLM call span |
-| Cost per user | "Unit economics" | Dollar cost attributed to a user_id over a window; key product metric |
-
-## Further Reading
-
-- [Langfuse](https://github.com/langfuse/langfuse) — the reference open-core observability platform
-- [Arize Phoenix](https://github.com/Arize-ai/phoenix) — alternate reference with strong drift support
-- [OpenLLMetry (Traceloop)](https://github.com/traceloop/openllmetry) — auto-instrumentation SDK family
-- [OpenTelemetry GenAI semantic conventions](https://opentelemetry.io/docs/specs/semconv/gen-ai/) — the ingest schema
-- [Helicone](https://www.helicone.ai) — alternate hosted observability
-- [Braintrust](https://www.braintrust.dev) — alternate eval-first platform
-- [ClickHouse documentation](https://clickhouse.com/docs) — columnar span store
-- [DeepEval](https://github.com/confident-ai/deepeval) — evaluator library
